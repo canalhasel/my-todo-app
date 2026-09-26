@@ -1,9 +1,16 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { createClient } from "@/lib/supabase/server";
+import { isPriority, type Priority } from "@/lib/priority";
+import { parseDueDate, toTodoDTO } from "@/lib/todos";
 import type { ApiErrorResponse, TodoDTO } from "@/app/api/todos/route";
 
-export type UpdateTodoRequestBody = { isCompleted: boolean };
+export type UpdateTodoRequestBody = {
+  isCompleted?: boolean;
+  priority?: Priority;
+  /** "YYYY-MM-DD", or null to clear the due date. */
+  dueDate?: string | null;
+};
 export type UpdateTodoResponse = { todo: TodoDTO };
 export type DeleteTodoResponse = { success: true };
 
@@ -26,9 +33,48 @@ export async function PATCH(
   const { id } = await ctx.params;
   const body = (await request.json()) as UpdateTodoRequestBody;
 
-  const { count } = await prisma.todo.updateMany({
-    where: { id, userId: user.id },
-    data: { isCompleted: body.isCompleted },
+  const dueDate =
+    body.dueDate === undefined ? undefined : parseDueDate(body.dueDate);
+  if (body.dueDate !== undefined && dueDate === undefined) {
+    return NextResponse.json<ApiErrorResponse>(
+      { error: "期限日の形式が正しくありません。" },
+      { status: 400 },
+    );
+  }
+
+  if (body.priority !== undefined && !isPriority(body.priority)) {
+    return NextResponse.json<ApiErrorResponse>(
+      { error: "優先度は S / A / B / C のいずれかです。" },
+      { status: 400 },
+    );
+  }
+
+  const count = await prisma.$transaction(async (tx) => {
+    const existing = await tx.todo.findFirst({
+      where: { id, userId: user.id },
+    });
+    if (!existing) return 0;
+
+    // A TODO moved to another priority joins the bottom of that group.
+    let position: number | undefined;
+    if (body.priority && body.priority !== existing.priority) {
+      const { _max } = await tx.todo.aggregate({
+        where: { userId: user.id, priority: body.priority },
+        _max: { position: true },
+      });
+      position = (_max.position ?? 0) + 1;
+    }
+
+    await tx.todo.update({
+      where: { id },
+      data: {
+        isCompleted: body.isCompleted,
+        priority: body.priority,
+        position,
+        dueDate,
+      },
+    });
+    return 1;
   });
 
   if (count === 0) {
@@ -42,14 +88,7 @@ export async function PATCH(
     where: { id, userId: user.id },
   });
 
-  return NextResponse.json<UpdateTodoResponse>({
-    todo: {
-      id: todo.id,
-      title: todo.title,
-      isCompleted: todo.isCompleted,
-      createdAt: todo.createdAt.toISOString(),
-    },
-  });
+  return NextResponse.json<UpdateTodoResponse>({ todo: toTodoDTO(todo) });
 }
 
 export async function DELETE(
