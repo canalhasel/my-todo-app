@@ -15,8 +15,12 @@ enum Priority {
 }
 
 model Todo {
-  id          String   @id @default(uuid()) @db.Uuid
-  userId      String   @map("user_id") @db.Uuid
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  // Subtasks point at their parent. Only two levels: a parent's parentId is null.
+  parentId    String?   @map("parent_id") @db.Uuid
+  parent      Todo?     @relation("Subtasks", fields: [parentId], references: [id], onDelete: Cascade)
+  subtasks    Todo[]    @relation("Subtasks")
   title       String
   isCompleted Boolean   @default(false) @map("is_completed")
   priority    Priority  @default(B)
@@ -26,5 +30,6 @@ model Todo {
   createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
 
   @@index([userId, priority, position])
+  @@index([parentId])
   @@map("todos")
 }

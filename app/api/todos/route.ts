@@ -2,10 +2,19 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { createClient } from "@/lib/supabase/server";
 import { DEFAULT_PRIORITY, isPriority, type Priority } from "@/lib/priority";
-import { parseDueDate, TODO_ORDER, toTodoDTO } from "@/lib/todos";
+import {
+  listTodos,
+  nextPosition,
+  parseDueDate,
+  syncParentCompletion,
+  TODO_ORDER,
+  toTodoDTO,
+} from "@/lib/todos";
 
 export type TodoDTO = {
   id: string;
+  /** The parent TODO's id for a subtask, or null for a top-level TODO. */
+  parentId: string | null;
   title: string;
   isCompleted: boolean;
   priority: Priority;
@@ -18,10 +27,13 @@ export type TodoDTO = {
 export type GetTodosResponse = { todos: TodoDTO[] };
 export type CreateTodoRequestBody = {
   title: string;
+  /** Adds the TODO as a subtask of this top-level TODO. */
+  parentId?: string | null;
   priority?: Priority;
   dueDate?: string | null;
 };
-export type CreateTodoResponse = { todo: TodoDTO };
+/** Adding a subtask can reopen its parent, so the whole list comes back. */
+export type CreateTodoResponse = { todos: TodoDTO[] };
 export type ApiErrorResponse = { error: string };
 
 export async function GET() {
@@ -86,25 +98,47 @@ export async function POST(request: Request) {
     );
   }
 
-  // New TODOs go to the bottom of their priority group.
-  const todo = await prisma.$transaction(async (tx) => {
-    const { _max } = await tx.todo.aggregate({
-      where: { userId: user.id, priority },
-      _max: { position: true },
-    });
-    return tx.todo.create({
+  const parentId = body.parentId ?? null;
+
+  const todos = await prisma.$transaction(async (tx) => {
+    if (parentId) {
+      const parent = await tx.todo.findFirst({
+        where: { id: parentId, userId: user.id },
+      });
+      // Only two levels: a subtask cannot have subtasks of its own.
+      if (!parent || parent.parentId) return null;
+    }
+
+    // New TODOs go to the bottom of their sibling group.
+    await tx.todo.create({
       data: {
         userId: user.id,
+        parentId,
         title,
         priority,
         dueDate,
-        position: (_max.position ?? 0) + 1,
+        position: await nextPosition(tx, {
+          userId: user.id,
+          parentId,
+          priority,
+        }),
       },
     });
+    // A new, unfinished subtask reopens a completed parent.
+    if (parentId) await syncParentCompletion(tx, parentId);
+
+    return listTodos(tx, user.id);
   });
 
+  if (!todos) {
+    return NextResponse.json<ApiErrorResponse>(
+      { error: "サブタスクを追加できる親の TODO が見つかりません。" },
+      { status: 400 },
+    );
+  }
+
   return NextResponse.json<CreateTodoResponse>(
-    { todo: toTodoDTO(todo) },
+    { todos: todos.map(toTodoDTO) },
     { status: 201 },
   );
 }

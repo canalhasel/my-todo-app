@@ -2,17 +2,27 @@ import { NextResponse, type NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { createClient } from "@/lib/supabase/server";
 import { isPriority, type Priority } from "@/lib/priority";
-import { parseDueDate, toTodoDTO } from "@/lib/todos";
+import {
+  listTodos,
+  nextPosition,
+  parseDueDate,
+  syncParentCompletion,
+  toTodoDTO,
+} from "@/lib/todos";
 import type { ApiErrorResponse, TodoDTO } from "@/app/api/todos/route";
 
 export type UpdateTodoRequestBody = {
+  /** On a parent, its subtasks follow; on a subtask, the parent is re-synced. */
   isCompleted?: boolean;
   priority?: Priority;
   /** "YYYY-MM-DD", or null to clear the due date. */
   dueDate?: string | null;
+  /** null promotes a subtask to a top-level TODO. */
+  parentId?: null;
 };
-export type UpdateTodoResponse = { todo: TodoDTO };
-export type DeleteTodoResponse = { success: true };
+/** Completion cascades between parent and subtasks, so the whole list comes back. */
+export type UpdateTodoResponse = { todos: TodoDTO[] };
+export type DeleteTodoResponse = { todos: TodoDTO[] };
 
 export async function PATCH(
   request: NextRequest,
@@ -49,21 +59,29 @@ export async function PATCH(
     );
   }
 
-  const count = await prisma.$transaction(async (tx) => {
+  if (body.parentId !== undefined && body.parentId !== null) {
+    return NextResponse.json<ApiErrorResponse>(
+      { error: "parentId は null（格上げ）のみ指定できます。" },
+      { status: 400 },
+    );
+  }
+
+  const todos = await prisma.$transaction(async (tx) => {
     const existing = await tx.todo.findFirst({
       where: { id, userId: user.id },
     });
-    if (!existing) return 0;
+    if (!existing) return null;
 
-    // A TODO moved to another priority joins the bottom of that group.
-    let position: number | undefined;
-    if (body.priority && body.priority !== existing.priority) {
-      const { _max } = await tx.todo.aggregate({
-        where: { userId: user.id, priority: body.priority },
-        _max: { position: true },
-      });
-      position = (_max.position ?? 0) + 1;
-    }
+    const priority = body.priority ?? existing.priority;
+    const isPromoting = body.parentId === null && existing.parentId !== null;
+    const parentId = isPromoting ? null : existing.parentId;
+
+    // Joining another sibling group (new priority, or promoted to the top
+    // level) puts the TODO at the bottom of that group.
+    const position =
+      priority !== existing.priority || isPromoting
+        ? await nextPosition(tx, { userId: user.id, parentId, priority })
+        : undefined;
 
     await tx.todo.update({
       where: { id },
@@ -72,23 +90,34 @@ export async function PATCH(
         priority: body.priority,
         position,
         dueDate,
+        parentId: isPromoting ? null : undefined,
       },
     });
-    return 1;
+
+    if (body.isCompleted !== undefined && existing.parentId === null) {
+      // Checking or unchecking a parent does the same to all its subtasks.
+      await tx.todo.updateMany({
+        where: { parentId: id },
+        data: { isCompleted: body.isCompleted },
+      });
+    }
+
+    // The old parent gained or lost an unfinished subtask.
+    if (existing.parentId && (body.isCompleted !== undefined || isPromoting)) {
+      await syncParentCompletion(tx, existing.parentId);
+    }
+
+    return listTodos(tx, user.id);
   });
 
-  if (count === 0) {
+  if (!todos) {
     return NextResponse.json<ApiErrorResponse>(
       { error: "TODO が見つかりません。" },
       { status: 404 },
     );
   }
 
-  const todo = await prisma.todo.findFirstOrThrow({
-    where: { id, userId: user.id },
-  });
-
-  return NextResponse.json<UpdateTodoResponse>({ todo: toTodoDTO(todo) });
+  return NextResponse.json<UpdateTodoResponse>({ todos: todos.map(toTodoDTO) });
 }
 
 export async function DELETE(
@@ -109,16 +138,29 @@ export async function DELETE(
 
   const { id } = await ctx.params;
 
-  const { count } = await prisma.todo.deleteMany({
-    where: { id, userId: user.id },
+  const todos = await prisma.$transaction(async (tx) => {
+    const existing = await tx.todo.findFirst({
+      where: { id, userId: user.id },
+    });
+    if (!existing) return null;
+
+    // Subtasks go with their parent (ON DELETE CASCADE).
+    await tx.todo.delete({ where: { id } });
+
+    // Removing an unfinished subtask may leave the rest all done.
+    if (existing.parentId) {
+      await syncParentCompletion(tx, existing.parentId);
+    }
+
+    return listTodos(tx, user.id);
   });
 
-  if (count === 0) {
+  if (!todos) {
     return NextResponse.json<ApiErrorResponse>(
       { error: "TODO が見つかりません。" },
       { status: 404 },
     );
   }
 
-  return NextResponse.json<DeleteTodoResponse>({ success: true });
+  return NextResponse.json<DeleteTodoResponse>({ todos: todos.map(toTodoDTO) });
 }

@@ -20,6 +20,7 @@ export const TODO_ORDER = [
 export function toTodoDTO(todo: Todo): TodoDTO {
   return {
     id: todo.id,
+    parentId: todo.parentId,
     title: todo.title,
     isCompleted: todo.isCompleted,
     priority: todo.priority,
@@ -27,6 +28,48 @@ export function toTodoDTO(todo: Todo): TodoDTO {
     dueDate: todo.dueDate ? todo.dueDate.toISOString().slice(0, 10) : null,
     createdAt: todo.createdAt.toISOString(),
   };
+}
+
+/** The whole list in display order, for responses that touch several rows. */
+export function listTodos(tx: Prisma.TransactionClient, userId: string) {
+  return tx.todo.findMany({ where: { userId }, orderBy: TODO_ORDER });
+}
+
+/**
+ * The next position at the bottom of a sibling group (same parent and
+ * priority), so a TODO added or moved there lands last.
+ */
+export async function nextPosition(
+  tx: Prisma.TransactionClient,
+  where: {
+    userId: string;
+    parentId: string | null;
+    priority: Todo["priority"];
+  },
+) {
+  const { _max } = await tx.todo.aggregate({ where, _max: { position: true } });
+  return (_max.position ?? 0) + 1;
+}
+
+/**
+ * A parent with subtasks is complete exactly when all of them are. Call after
+ * any change to a parent's set of subtasks or to one subtask's completion.
+ * A parent left with no subtasks keeps whatever state it had.
+ */
+export async function syncParentCompletion(
+  tx: Prisma.TransactionClient,
+  parentId: string,
+) {
+  const subtasks = await tx.todo.findMany({
+    where: { parentId },
+    select: { isCompleted: true },
+  });
+  if (subtasks.length === 0) return;
+
+  await tx.todo.update({
+    where: { id: parentId },
+    data: { isCompleted: subtasks.every((subtask) => subtask.isCompleted) },
+  });
 }
 
 /**
@@ -39,7 +82,10 @@ export function parseDueDate(value: unknown): Date | null | undefined {
 
   const date = new Date(`${value}T00:00:00Z`);
   // Rejects dates like 2026-02-31, which Date silently rolls over.
-  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) {
+  if (
+    Number.isNaN(date.getTime()) ||
+    date.toISOString().slice(0, 10) !== value
+  ) {
     return undefined;
   }
   return date;

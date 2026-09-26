@@ -1,12 +1,12 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { createClient } from "@/lib/supabase/server";
-import { TODO_ORDER, toTodoDTO } from "@/lib/todos";
+import { listTodos, TODO_ORDER, toTodoDTO } from "@/lib/todos";
 import type { ApiErrorResponse, TodoDTO } from "@/app/api/todos/route";
 
 /**
- * Swaps the TODO with its neighbour among TODOs sharing its priority and due
- * date — the only ones the list order leaves to the user.
+ * Swaps the TODO with its neighbour among siblings (same parent) sharing its
+ * priority and due date — the only ones the list order leaves to the user.
  */
 export type MoveTodoRequestBody = { direction: "up" | "down" };
 /** Moving one TODO renumbers others, so the whole list comes back. */
@@ -47,6 +47,7 @@ export async function PUT(
     const group = await tx.todo.findMany({
       where: {
         userId: user.id,
+        parentId: target.parentId,
         priority: target.priority,
         dueDate: target.dueDate,
       },
@@ -71,10 +72,7 @@ export async function PUT(
       }
     }
 
-    return tx.todo.findMany({
-      where: { userId: user.id },
-      orderBy: TODO_ORDER,
-    });
+    return listTodos(tx, user.id);
   });
 
   if (!todos) {
