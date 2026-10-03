@@ -106,8 +106,7 @@ function swapWithNeighbour(
   if (!isSwappable(target, neighbour)) return todos;
 
   return sortTodos(
-    //todos.map(t)
-    [].map((t) =>
+    todos.map((t) =>
       t.id === target.id
         ? { ...t, position: neighbour.position }
         : t.id === neighbour.id
